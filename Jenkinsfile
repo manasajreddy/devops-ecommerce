@@ -1,5 +1,6 @@
 
 
+
 pipeline {
     agent any
 
@@ -9,83 +10,95 @@ pipeline {
     }
 
     environment {
-        APP_IMAGE = "ecommerce-app"
+        IMAGE_NAME = 'ecommerce-app'
     }
 
     stages {
 
         stage('Checkout Verification') {
             steps {
-                echo 'Starting E-commerce CI/CD Pipeline'
-                echo 'Repository checkout successful'
-
-                sh 'pwd'
-                sh 'ls -la'
+                echo 'Checking out the source code'
+                sh 'git status --short'
                 sh 'git rev-parse --short HEAD'
             }
         }
 
-        stage('Project Verification') {
+        stage('Automated Testing') {
             steps {
                 sh '''
-                    test -f requirements.txt
-                    test -f docker/Dockerfile
-                    test -d app
-                    test -d tests
+                    set -eu
 
-                    echo "Project structure verified"
+                    TEST_CONTAINER="ecommerce-test-${BUILD_NUMBER}"
+
+                    docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
+
+                    docker create \
+                        --name "$TEST_CONTAINER" \
+                        -w /workspace \
+                        python:3.13-slim sleep infinity
+
+                    docker cp "$WORKSPACE/." "$TEST_CONTAINER:/workspace"
+
+                    docker start "$TEST_CONTAINER"
+
+                    docker exec "$TEST_CONTAINER" sh -c \
+                      "python -m pip install --no-cache-dir -r requirements.txt && python -m pytest -v"
+
+                    docker rm -f "$TEST_CONTAINER"
                 '''
             }
         }
 
-        stage('Install Dependencies and Test') {
+        stage('Docker Image Build') {
             steps {
                 sh '''
-                    docker run --rm \
-                      --volumes-from jenkins-server \
-                      -w "$WORKSPACE" \
-                      python:3.13-slim \
-                      sh -c "python -m pip install --no-cache-dir -r requirements.txt && python -m pytest -v"
-                '''
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                sh '''
+                    set -eu
                     docker build \
-                      -f docker/Dockerfile \
-                      -t ${APP_IMAGE}:${BUILD_NUMBER} \
-                      .
+                        -f docker/Dockerfile \
+                        -t ecommerce-app:${BUILD_NUMBER} .
                 '''
             }
         }
 
-        stage('Verify Docker Image') {
+        stage('Container Deployment Test') {
             steps {
                 sh '''
-                    docker image inspect \
-                      ${APP_IMAGE}:${BUILD_NUMBER}
+                    set -eu
 
-                    docker images ${APP_IMAGE}
+                    APP_CONTAINER="ecommerce-ci-${BUILD_NUMBER}"
+
+                    docker rm -f "$APP_CONTAINER" >/dev/null 2>&1 || true
+
+                    docker run -d \
+                        --name "$APP_CONTAINER" \
+                        -p 18080:8080 \
+                        ecommerce-app:${BUILD_NUMBER}
+
+                    sleep 5
+
+                    docker exec "$APP_CONTAINER" python -c \
+                      "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=10); print(r.status, r.read().decode()); assert r.status == 200"
+
+                    docker rm -f "$APP_CONTAINER"
                 '''
             }
         }
     }
 
     post {
+        always {
+            sh '''
+                docker rm -f "ecommerce-test-${BUILD_NUMBER}" >/dev/null 2>&1 || true
+                docker rm -f "ecommerce-ci-${BUILD_NUMBER}" >/dev/null 2>&1 || true
+            '''
+        }
+
         success {
-            echo 'SUCCESS: All CI stages completed!'
-            echo 'Automated tests passed.'
-            echo 'Docker image built successfully.'
+            echo 'CI PIPELINE SUCCESSFUL: Tests passed, image built and container health verified.'
         }
 
         failure {
-            echo 'FAILURE: Check the Jenkins Console Output.'
-        }
-
-        always {
-            echo 'CI Pipeline execution finished.'
+            echo 'CI PIPELINE FAILED: Check the failed stage in Console Output.'
         }
     }
 }
